@@ -68,7 +68,7 @@ def plot_lr(df, save_path="data/lr_curve.png"):
 # ------------------------------
 if __name__ == "__main__":
     # 参数配置
-    LOG_PATH = "../data/trainer_log.jsonl"  # 日志文件路径
+    LOG_PATH = "data/trainer_log.jsonl"  # 日志文件路径
 
     # 加载数据并平滑处理
     df = load_logs(LOG_PATH)
