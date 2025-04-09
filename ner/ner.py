@@ -2,12 +2,13 @@ import json
 
 import numpy as np
 import torch
+from ckip_transformers.nlp import CkipNerChunker
 from seqeval.metrics import classification_report
 from sklearn.metrics import precision_recall_fscore_support
 from torch import nn
 from torch.utils.data import Dataset, DataLoader, random_split
 from tqdm import tqdm
-from transformers import AutoTokenizer, AutoModel, pipeline, AutoConfig
+from transformers import AutoTokenizer, AutoModel, pipeline, AutoConfig, get_linear_schedule_with_warmup, BertTokenizerFast
 
 
 # ==================== 数据加载部分 ====================
@@ -63,20 +64,27 @@ class NERDataset(Dataset):
         )
 
         labels = torch.zeros(self.max_length, dtype=torch.long)
+
+        offset_mapping = self.tokenizer(text, return_offsets_mapping=True).offset_mapping
+        char_to_token = self.tokenizer(text, return_offsets_mapping=True).char_to_token
+
         for ann in annotations:
             start = ann["start_offset"]
             end = ann["end_offset"]
-            entity = ann["entity"]
             label = ann["label"]
 
-            char_to_token = self.tokenizer(text, return_offsets_mapping=True).char_to_token
+            # 检查字符偏移量是否超出了tokenizer处理的文本范围
+            if start >= len(text) or end > len(text):
+                continue
+
             token_start = char_to_token(start)
             token_end = char_to_token(end - 1) if end > start else token_start
 
+            # 检查token索引是否在有效范围内，并考虑截断的影响
             if token_start is not None and token_end is not None:
-                labels[token_start] = self.label2id[f"B-{label}"]
-                for i in range(token_start + 1, token_end + 1):
-                    if i < self.max_length:
+                if token_start < self.max_length:
+                    labels[token_start] = self.label2id[f"B-{label}"]
+                    for i in range(token_start + 1, min(token_end + 1, self.max_length)):
                         labels[i] = self.label2id[f"I-{label}"]
 
         return {
@@ -106,17 +114,84 @@ def collate_fn(batch):
 
 # ==================== 模型架构部分 ====================
 class EntityRecognizer(nn.Module):
-    def __init__(self, model_name, num_labels):
+    def __init__(self, model_name, num_labels, hidden_dropout=0.2):
         super().__init__()
         self.config = AutoConfig.from_pretrained(model_name)
         self.encoder = AutoModel.from_pretrained(model_name, config=self.config)
-        self.classifier = nn.Linear(self.config.hidden_size, num_labels)
+
+        # 冻结编码器
+        for param in self.encoder.parameters():
+            param.requires_grad = False
+        self.encoder.eval()
+
+        hidden_size = self.config.hidden_size
+
+        # 增强型分类头 - 多层架构
+        self.feature_extractor = nn.Sequential(
+            # 第一层变换 - 维度降低并提取特征
+            nn.Linear(hidden_size, 1024),
+            nn.LayerNorm(1024),
+            nn.GELU(),
+            nn.Dropout(hidden_dropout),
+
+            # 第二层变换 - 提取更高级特征
+            nn.Linear(1024, 512),
+            nn.LayerNorm(512),
+            nn.GELU(),
+            nn.Dropout(hidden_dropout),
+
+            # 特征压缩层
+            nn.Linear(512, 256),
+            nn.LayerNorm(256)
+        )
+
+        # 分类器 - 从提取的特征预测标签
+        self.classifier = nn.Sequential(
+            nn.Dropout(hidden_dropout),
+            nn.Linear(256, num_labels)
+        )
+
+        # 残差连接 - 直接从原始特征到输出的路径
+        self.residual_proj = nn.Linear(hidden_size, num_labels)
+
+        # 注意力层 - 关注相关token位置
+        self.attention = nn.MultiheadAttention(embed_dim=hidden_size,
+                                               num_heads=8,
+                                               batch_first=True)
 
     def forward(self, input_ids, attention_mask):
-        outputs = self.encoder(input_ids=input_ids, attention_mask=attention_mask)
-        sequence_output = outputs.last_hidden_state
-        logits = self.classifier(sequence_output)
-        return logits
+        with torch.no_grad():
+            outputs = self.encoder(input_ids=input_ids, attention_mask=attention_mask)
+            sequence_output = outputs.last_hidden_state
+
+            # 转换为float32
+            sequence_output = sequence_output.float()
+
+        # 应用自注意力机制
+        attn_mask = attention_mask.float().masked_fill(
+            attention_mask == 0, float('-inf')).masked_fill(
+            attention_mask == 1, float(0.0))
+        attn_output, _ = self.attention(
+            sequence_output, sequence_output, sequence_output,
+            key_padding_mask=~attention_mask.bool()
+        )
+
+        # 残差连接 - 将原始输出与注意力输出相加
+        enhanced_output = sequence_output + attn_output
+
+        # 通过特征提取器
+        extracted_features = self.feature_extractor(enhanced_output)
+
+        # 主分类路径
+        main_logits = self.classifier(extracted_features)
+
+        # 残差分类路径
+        residual_logits = self.residual_proj(sequence_output)
+
+        # 组合两个路径的输出
+        logits = main_logits + 0.2 * residual_logits
+
+        return logits, enhanced_output  # 返回logits和特征表示
 
 
 class QuadrupletLoss(nn.Module):
@@ -167,11 +242,11 @@ class LLMCC(nn.Module):
                 positive_positions,
                 negative1_positions,
                 negative2_positions):
-        # 实体识别
-        logits = self.recognizer(input_ids, attention_mask)
+        # 前向传播获取logits和embeddings
+        logits, embeddings = self.recognizer(input_ids, attention_mask)
 
-        # 获取对比学习所需的嵌入
-        embeddings = self.recognizer.encoder(input_ids, attention_mask).last_hidden_state
+        # 交叉熵损失
+        ce_loss = nn.CrossEntropyLoss()(logits.view(-1, logits.size(-1)), labels.view(-1))
 
         # 收集对比学习的样本
         anchor_emb = embeddings[torch.arange(embeddings.size(0)), anchor_positions]
@@ -179,12 +254,16 @@ class LLMCC(nn.Module):
         negative1_emb = embeddings[torch.arange(embeddings.size(0)), negative1_positions]
         negative2_emb = embeddings[torch.arange(embeddings.size(0)), negative2_positions]
 
-        # 计算各种损失
-        ce_loss = nn.CrossEntropyLoss()(logits.view(-1, logits.size(-1)), labels.view(-1))
+        # 计算对比损失
         contrastive_loss = self.contrastive_loss(anchor_emb, positive_emb, negative1_emb, negative2_emb)
+
+        # 上下文连续性损失
         context_loss = self.context_loss(embeddings, labels)
 
-        total_loss = ce_loss + contrastive_loss + context_loss
+        # 总损失 - 可调整权重
+        alpha = 0.2  # 对比损失权重
+        beta = 0.1  # 上下文损失权重
+        total_loss = ce_loss + alpha * contrastive_loss + beta * context_loss
 
         return {
             "logits": logits,
@@ -481,11 +560,16 @@ def train_model(config):
 
     # 初始化模型
     model = LLMCC(config["model_path"], len(train_dataset.label2id)).to(device)
-    optimizer = torch.optim.AdamW(model.parameters(), lr=config["lr"])
-    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+    optimizer = torch.optim.AdamW(
+        [p for p in model.parameters() if p.requires_grad],
+        lr=config["lr"]
+    )
+    total_steps = len(train_loader) * config["epochs"]
+    warmup_steps = int(config.get("warmup_steps", 0.1) * total_steps)
+    scheduler = get_linear_schedule_with_warmup(
         optimizer,
-        T_max=config["epochs"] * len(train_loader),
-        eta_min=1e-6
+        num_warmup_steps=warmup_steps,
+        num_training_steps=total_steps
     )
 
     # 初始化实体预测增强器
@@ -496,6 +580,8 @@ def train_model(config):
         train_dataset.id2label
     ) if config["use_enhancer"] else None
 
+    accumulation_steps = config.get("accumulation_steps", 4)
+
     best_f1 = 0.0
     for epoch in range(config["epochs"]):
         print(f"\nEpoch {epoch + 1}/{config['epochs']}")
@@ -503,8 +589,12 @@ def train_model(config):
         # 训练阶段
         model.train()
         train_loss = 0.0
+        # 记录当前批次
+        batch_count = 0
         for batch in tqdm(train_loader, desc="Training"):
-            optimizer.zero_grad()
+            # 只在accumulation_steps的整数倍批次上清零梯度
+            if batch_count % accumulation_steps == 0:
+                optimizer.zero_grad()
 
             # 随机选择对比学习的样本位置
             batch_size, seq_len = batch["labels"].shape
@@ -539,12 +629,18 @@ def train_model(config):
                 negative2_positions=negative2_positions
             )
 
-            # 反向传播
-            outputs["total_loss"].backward()
-            optimizer.step()
-            scheduler.step()
+            # 计算损失并除以累积步数（归一化梯度）
+            loss = outputs["total_loss"] / accumulation_steps
 
+            # 只在累积了指定步数的梯度后才更新参数
+            if (batch_count + 1) % accumulation_steps == 0 or (batch_count + 1) == len(train_loader):
+                optimizer.step()
+                scheduler.step()
+                optimizer.zero_grad()  # 可选：立即清零梯度
+
+            # 记录原始损失（未除以accumulation_steps的值，用于日志记录）
             train_loss += outputs["total_loss"].item()
+            batch_count += 1
 
         avg_train_loss = train_loss / len(train_loader)
         print(f"Train Loss: {avg_train_loss:.4f}")
@@ -582,15 +678,28 @@ def train_model(config):
     print(f"\nTraining complete. Best F1 Score: {best_f1:.4f}")
 
 
-# ==================== 主程序 ====================
-if __name__ == "__main__":
+def main():
     train_model({
         "model_path": "D:/Code/model/Qwen2.5-7B-MedChatZH-LoRA-SFT-GPTQ-Int4",
         "data_path": "data/data.json",  # 数据文件路径
         "max_length": 1024,  # 最大序列长度
-        "batch_size": 8,  # 批大小
-        "lr": 2e-5,  # 学习率
-        "epochs": 5,  # 训练轮数
+        "batch_size": 2,  # 批大小
+        "accumulation_steps": 4,  # 梯度累积步数
+        "lr": 5e-4,  # 学习率
+        "epochs": 20,  # 训练轮数
+        "weight_decay": 0.01,  # 增加权重衰减
+        "warmup_steps": 0.1,  # 学习率预热
         "save_path": "best_model.pt",  # 模型保存路径
         "use_enhancer": False  # 是否使用实体预测增强
     })
+
+
+def ner_with_pretrained_model(text_list):
+    ner_driver = CkipNerChunker(model="bert-base")
+    return ner_driver(text_list, use_delim=True)
+
+
+# ==================== 主程序 ====================
+if __name__ == "__main__":
+    text = ["生姜的作用是什么"]
+    print(ner_with_pretrained_model(text))
