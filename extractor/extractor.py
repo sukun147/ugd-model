@@ -28,28 +28,28 @@ class KnowledgeExtractor:
         self.kg = Graph(neo4j_uri, auth=(neo4j_user, neo4j_password))
 
         # 初始化嵌入模型
-        self.embedding_model = SentenceTransformer(embedding_model_name).to(self.device)
-        self.embedding_dim = self.embedding_model.get_sentence_embedding_dimension()
+        # self.embedding_model = SentenceTransformer(embedding_model_name).to(self.device)
+        # self.embedding_dim = self.embedding_model.get_sentence_embedding_dimension()
 
         # 初始化策略网络
-        self.policy_net = PolicyNetwork(self.embedding_dim * 2, self.embedding_dim).to(self.device)  # 状态是当前实体和目标实体的组合
+        # self.policy_net = PolicyNetwork(self.embedding_dim * 2, self.embedding_dim).to(self.device)  # 状态是当前实体和目标实体的组合
 
         # 优化器
-        self.optimizer = optim.Adam(self.policy_net.parameters(), lr=0.001)
+        # self.optimizer = optim.Adam(self.policy_net.parameters(), lr=0.001)
 
-        torch.nn.utils.clip_grad_norm_(self.policy_net.parameters(), max_norm=1.0)
+        # torch.nn.utils.clip_grad_norm_(self.policy_net.parameters(), max_norm=1.0)
 
         # 经验回放
-        self.replay_buffer = deque(maxlen=10000)
+        # self.replay_buffer = deque(maxlen=10000)
 
         # GRPO特有参数
-        self.gamma = 0.99  # 折扣因子
-        self.epsilon = 0.1  # 探索率
-        self.max_path_len = 10  # 最大路径长度
-        self.batch_size = 1  # 训练批大小
-        self.eta = 0.2  # 信任区域半径
-        self.max_kl = 0.01  # KL散度约束
-        self.gae_lambda = 0.95  # GAE参数
+        # self.gamma = 0.99  # 折扣因子
+        # self.epsilon = 0.1  # 探索率
+        # self.max_path_len = 10  # 最大路径长度
+        # self.batch_size = 1  # 训练批大小
+        # self.eta = 0.2  # 信任区域半径
+        # self.max_kl = 0.01  # KL散度约束
+        # self.gae_lambda = 0.95  # GAE参数
 
     def _get_entity_embedding(self, entity_name):
         """
@@ -347,13 +347,13 @@ if __name__ == '__main__':
         embedding_model_name="intfloat/multilingual-e5-small"
     )
 
-    source_entities = ["咳嗽"]
-    target_entities = ["化痰止咳"]
+    source_entities = ["生姜"]
+    target_entities = []
 
     subgraph_entities, subgraph_triples = extractor.extract_subgraph(
         source_entities, target_entities, max_hops=1
     )
-    print("启发式提取的子图三元组:", subgraph_triples)
+    print(subgraph_triples)
 
     # 存在梯度消失问题，策略没有得到训练
     # train_data = [
