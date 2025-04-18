@@ -12,6 +12,12 @@ from transformers import AutoTokenizer, AutoModel
 from vllm import LLM, SamplingParams
 
 
+prompt = """你是一个中医领域的知识图谱问答助手，你的任务是根据问题和知识图谱中的信息来回答问题。
+问题: {question}
+知识图谱中的信息: {knowledge}
+请根据知识图谱中的信息回答问题。"""
+
+
 class KnowledgeGraphLoader:
     def __init__(self, uri, user, password):
         self.graph = Graph(uri, auth=(user, password))
@@ -162,25 +168,26 @@ def batch_query_and_search(queries, model, tokenizer, index, k=5, batch_size=32)
 
 
 # 5. 使用vLLM生成回答
-def generate_answer(prompt, knowledge, llm, tokenizer):
-    input_text = prompt + "\n" + "\n".join(knowledge)
+def generate_answer(question, knowledge, llm, tokenizer):
+    # Format the prompt with the question and knowledge
+    formatted_prompt = prompt.format(question=question, knowledge="\n".join(knowledge))
 
-    # 使用vLLM生成回答
+    # Use vLLM to generate an answer
     sampling_params = SamplingParams(temperature=0.7, top_p=0.9, max_tokens=512)
 
-    # 创建聊天消息格式
+    # Create chat message format
     messages = [
-        {"role": "user", "content": input_text}
+        {"role": "user", "content": formatted_prompt}
     ]
 
-    # 应用聊天模板
+    # Apply chat template
     text = tokenizer.apply_chat_template(
         messages,
         tokenize=False,
         add_generation_prompt=True
     )
 
-    # 使用vLLM生成
+    # Generate using vLLM
     outputs = llm.generate([text], sampling_params)
     answer = outputs[0].outputs[0].text
 
@@ -188,15 +195,15 @@ def generate_answer(prompt, knowledge, llm, tokenizer):
 
 
 # 批量生成答案
-def batch_generate_answers(prompt, batch_knowledge, llm, tokenizer, batch_size=5):
+def batch_generate_answers(batch_questions, batch_knowledge, llm, tokenizer):
     all_answers = []
 
-    # 准备批量请求
+    # Prepare batch requests
     batch_texts = []
-    for knowledge in batch_knowledge:
-        input_text = prompt + "\n" + "\n".join(knowledge)
+    for question, knowledge in zip(batch_questions, batch_knowledge):
+        formatted_prompt = prompt.format(question=question, knowledge="\n".join(knowledge))
         messages = [
-            {"role": "user", "content": input_text}
+            {"role": "user", "content": formatted_prompt}
         ]
         text = tokenizer.apply_chat_template(
             messages,
@@ -205,11 +212,11 @@ def batch_generate_answers(prompt, batch_knowledge, llm, tokenizer, batch_size=5
         )
         batch_texts.append(text)
 
-    # 使用vLLM批量生成
+    # Use vLLM to generate answers in batch
     sampling_params = SamplingParams(temperature=0.7, top_p=0.9, max_tokens=512)
     outputs = llm.generate(batch_texts, sampling_params)
 
-    # 获取生成的答案
+    # Retrieve generated answers
     for output in outputs:
         answer = output.outputs[0].text
         all_answers.append(answer)
@@ -304,7 +311,7 @@ def batch_qa(questions, embedding_model, embedding_tokenizer, llm, gen_tokenizer
         batch_knowledge = all_retrieved_knowledge[i:i + batch_size]
 
         # 生成答案
-        batch_answers = batch_generate_answers(prompt, batch_knowledge, llm, gen_tokenizer, batch_size=batch_size)
+        batch_answers = batch_generate_answers(prompt, batch_knowledge, llm, gen_tokenizer)
 
         # 保存结果
         for j, (question, answer, knowledge) in enumerate(zip(batch_questions, batch_answers, batch_knowledge)):
@@ -531,9 +538,6 @@ if __name__ == "__main__":
         gpu_memory_utilization=0.9
     )
     print("vLLM引擎初始化完成")
-
-    # 提示词
-    prompt = "你是一个中医领域的知识图谱问答助手，你的任务是根据问题和知识图谱中的信息来回答问题。"
 
     if args.mode == "single":
         # 单个问题测试
