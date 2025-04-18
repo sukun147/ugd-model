@@ -501,7 +501,7 @@ if __name__ == "__main__":
     for i, (h, t, r) in enumerate(triples[:5]):
         print(f"{i + 1}. 头实体: {h}, 尾实体: {t}, 关系: {r}")
 
-    sentences = ["头实体《{}》和尾实体《{}》的关系是《{}》".format(h, t, r) for h, t, r in triples]
+    sentences = ["{}的{}是{}".format(h, r, t) for h, t, r in triples]
 
     # 加载嵌入模型
     print("正在加载嵌入模型...")
@@ -533,7 +533,7 @@ if __name__ == "__main__":
     print("vLLM引擎初始化完成")
 
     # 提示词
-    prompt = "你作为中医诊疗专家，请基于下列检索获得的中医知识进行回答，确保专业性与可读性的平衡，最终形成逻辑缜密、重点突出的中医知识回答："
+    prompt = "你是一个中医领域的知识图谱问答助手，你的任务是根据问题和知识图谱中的信息来回答问题。"
 
     if args.mode == "single":
         # 单个问题测试
