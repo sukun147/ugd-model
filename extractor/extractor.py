@@ -1,12 +1,9 @@
 import random
-from collections import deque
 
 import numpy as np
 import torch
 import torch.nn as nn
-import torch.optim as optim
 from py2neo import Graph
-from sentence_transformers import SentenceTransformer
 
 
 class KnowledgeExtractor:
