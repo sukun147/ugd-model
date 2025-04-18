@@ -11,13 +11,17 @@ from py2neo import Graph
 from transformers import AutoTokenizer, AutoModel
 from vllm import LLM, SamplingParams
 
+prompt = """你是一个中医领域的知识图谱问答助手，你的任务是根据问题和知识图谱中的信息来回答问题。
+问题: {question}
+知识图谱中的信息: {knowledge}
+请根据知识图谱中的信息回答问题。"""
+
 
 class KnowledgeGraphLoader:
     def __init__(self, uri, user, password):
         self.graph = Graph(uri, auth=(user, password))
 
     def load_knowledge_graph(self):
-        # 修改查询语句，使用type(r)函数获取关系类型
         query = """
         MATCH (h)-[r]->(t)
         RETURN h.name AS head, t.name AS tail, type(r) AS relation
@@ -161,9 +165,10 @@ def batch_query_and_search(queries, model, tokenizer, index, k=5, batch_size=32)
     return all_top_indices
 
 
-# 5. 使用vLLM生成回答
-def generate_answer(prompt, knowledge, llm, tokenizer):
-    input_text = prompt + "\n" + "\n".join(knowledge)
+# 更新generate_answer函数以支持格式化提示词
+def generate_answer(prompt_template, question, knowledge, llm, tokenizer):
+    # 格式化提示词
+    input_text = prompt_template.format(question=question, knowledge="\n".join(knowledge))
 
     # 使用vLLM生成回答
     sampling_params = SamplingParams(temperature=0.7, top_p=0.9, max_tokens=512)
@@ -187,14 +192,16 @@ def generate_answer(prompt, knowledge, llm, tokenizer):
     return answer
 
 
-# 批量生成答案
-def batch_generate_answers(prompt, batch_knowledge, llm, tokenizer, batch_size=5):
+# 更新batch_generate_answers函数以支持格式化提示词
+def batch_generate_answers(prompt_template, questions, batch_knowledge, llm, tokenizer, batch_size=5):
     all_answers = []
 
     # 准备批量请求
     batch_texts = []
-    for knowledge in batch_knowledge:
-        input_text = prompt + "\n" + "\n".join(knowledge)
+    for question, knowledge in zip(questions, batch_knowledge):
+        # 格式化提示词
+        input_text = prompt_template.format(question=question, knowledge="\n".join(knowledge))
+
         messages = [
             {"role": "user", "content": input_text}
         ]
@@ -215,6 +222,71 @@ def batch_generate_answers(prompt, batch_knowledge, llm, tokenizer, batch_size=5
         all_answers.append(answer)
 
     return all_answers
+
+
+def batch_qa(questions, embedding_model, embedding_tokenizer, llm, gen_tokenizer,
+             faiss_index, sentences, prompt_template, batch_size=5):
+    """批量处理问题，使用FAISS加速检索和vLLM加速生成"""
+    results = []
+    total_batches = (len(questions) + batch_size - 1) // batch_size  # 向上取整计算批次数
+
+    print(f"开始处理 {len(questions)} 个问题，共 {total_batches} 个批次")
+    start_time = time.time()
+
+    # 使用FAISS批量检索
+    print("正在执行向量检索...")
+    all_top_indices = batch_query_and_search(questions, embedding_model, embedding_tokenizer, faiss_index, k=5)
+
+    # 转换索引为知识文本
+    all_retrieved_knowledge = []
+    for indices in all_top_indices:
+        knowledge = [sentences[idx] for idx in indices]
+        all_retrieved_knowledge.append(knowledge)
+
+    # 批量生成答案
+    print("正在生成所有答案...")
+    for i in range(0, len(questions), batch_size):
+        batch_number = i // batch_size + 1
+        print(f"正在处理批次 {batch_number}/{total_batches}...")
+
+        batch_questions = questions[i:i + batch_size]
+        batch_knowledge = all_retrieved_knowledge[i:i + batch_size]
+
+        # 生成答案
+        batch_answers = batch_generate_answers(prompt_template, batch_questions, batch_knowledge, llm, gen_tokenizer,
+                                               batch_size=batch_size)
+
+        # 保存结果
+        for j, (question, answer, knowledge) in enumerate(zip(batch_questions, batch_answers, batch_knowledge)):
+            results.append({
+                "question": question,
+                "answer": answer,
+                "knowledge": knowledge
+            })
+
+        # 显示进度
+        processed_count = min(i + batch_size, len(questions))
+        elapsed_time = time.time() - start_time
+        avg_time_per_question = elapsed_time / processed_count if processed_count > 0 else 0
+        estimated_remaining = avg_time_per_question * (len(questions) - processed_count)
+
+        print(f"已处理 {processed_count}/{len(questions)} 个问题 "
+              f"({processed_count / len(questions) * 100:.1f}%), "
+              f"用时: {elapsed_time:.1f}秒, "
+              f"预计剩余: {estimated_remaining:.1f}秒")
+
+        # 及时保存中间结果
+        if batch_number % 5 == 0 or batch_number == total_batches:
+            temp_file = f"rag_results_temp_{batch_number}of{total_batches}.json"
+            with open(temp_file, 'w', encoding='utf-8') as f:
+                json.dump(results, f, ensure_ascii=False, indent=2)
+            print(f"中间结果已保存至 {temp_file}")
+
+    total_time = time.time() - start_time
+    print(f"批处理完成，共处理 {len(questions)} 个问题，总用时: {total_time:.1f}秒，"
+          f"平均每个问题: {total_time / len(questions):.1f}秒")
+
+    return results
 
 
 # 6. Load JSON dataset
@@ -549,7 +621,7 @@ if __name__ == "__main__":
             print(f"{i + 1}. {k}")
 
         # 生成答案
-        answer = generate_answer(prompt, top_k_knowledge, llm, gen_tokenizer)
+        answer = generate_answer(prompt, question, top_k_knowledge, llm, gen_tokenizer)
         print(f"回答: {answer}")
 
     elif args.mode == "batch":
@@ -560,24 +632,19 @@ if __name__ == "__main__":
         else:
             print("未提供问题列表，使用默认问题进行测试...")
             questions = ["生姜有什么功能？", "胃痛怎么办？", "中暑有什么症状？", "附子的功效是什么？", "如何治疗感冒？"]
-
         batch_results = batch_qa(questions, embedding_model, embedding_tokenizer, llm, gen_tokenizer,
                                  faiss_index, sentences, prompt, args.batch_size)
         save_batch_results(batch_results, args.output)
-
         # 打印结果摘要
         for i, result in enumerate(batch_results):
             print(f"问题 {i + 1}: {result['question']}")
             print(f"回答: {result['answer'][:100]}..." if len(result['answer']) > 100 else f"回答: {result['answer']}")
             print("-" * 50)
-
     elif args.mode == "evaluate":
         # 评估测试集
         print(f"开始评估测试集: {args.dataset}")
-
         metrics, _ = evaluate_dataset(args.dataset, embedding_model, embedding_tokenizer, llm, gen_tokenizer,
                                       faiss_index, sentences, prompt, args.batch_size)
-
         print("\n评估结果:")
         print("BERTScore:")
         for metric, score in metrics["BERTScore"].items():
