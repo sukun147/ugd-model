@@ -4,8 +4,6 @@ import gc
 import torch
 
 from bert_score import score as bert_score
-from nltk.translate.bleu_score import sentence_bleu, SmoothingFunction
-from rouge import Rouge
 from transformers import AutoTokenizer
 from vllm import LLM, SamplingParams
 
@@ -158,72 +156,6 @@ def batch_qa(questions, batch_size=5):
     return results
 
 
-def evaluate_bleu(predictions, references):
-    """分开计算BLEU分数，防止OOM"""
-    print("正在计算BLEU分数...")
-    smooth_fn = SmoothingFunction().method1
-    bleu_scores = []
-
-    # 分批计算BLEU
-    batch_size = 100
-    for i in range(0, len(predictions), batch_size):
-        print(f"BLEU: 处理批次 {i // batch_size + 1}/{(len(predictions) + batch_size - 1) // batch_size}")
-        batch_preds = predictions[i:i + batch_size]
-        batch_refs = references[i:i + batch_size]
-
-        for pred, ref in zip(batch_preds, batch_refs):
-            try:
-                bleu_score = sentence_bleu([ref.split()], pred.split(), smoothing_function=smooth_fn)
-                bleu_scores.append(bleu_score)
-            except Exception as e:
-                print(f"BLEU计算错误: {e}")
-                bleu_scores.append(0.0)
-
-        # 强制垃圾回收
-        gc.collect()
-
-    avg_bleu = sum(bleu_scores) / len(bleu_scores) if bleu_scores else 0
-    return avg_bleu
-
-
-def evaluate_rouge(predictions, references):
-    """分批计算ROUGE分数，防止OOM"""
-    print("正在计算ROUGE分数...")
-    rouge = Rouge()
-
-    # 分批计算ROUGE
-    all_scores = {'rouge-1': {'f': 0, 'p': 0, 'r': 0},
-                  'rouge-2': {'f': 0, 'p': 0, 'r': 0},
-                  'rouge-l': {'f': 0, 'p': 0, 'r': 0}}
-    count = 0
-
-    batch_size = 100
-    for i in range(0, len(predictions), batch_size):
-        print(f"ROUGE: 处理批次 {i // batch_size + 1}/{(len(predictions) + batch_size - 1) // batch_size}")
-        batch_preds = predictions[i:i + batch_size]
-        batch_refs = references[i:i + batch_size]
-
-        try:
-            batch_scores = rouge.get_scores(batch_preds, batch_refs, avg=True)
-            for metric, values in batch_scores.items():
-                for k, v in values.items():
-                    all_scores[metric][k] += v * len(batch_preds)
-            count += len(batch_preds)
-        except Exception as e:
-            print(f"ROUGE计算错误: {e}")
-
-        # 强制垃圾回收
-        gc.collect()
-
-    # 计算平均值
-    if count > 0:
-        for metric in all_scores:
-            for k in all_scores[metric]:
-                all_scores[metric][k] /= count
-
-    return all_scores
-
-
 def evaluate_bertscore(predictions, references):
     """分批计算BERTScore，防止OOM"""
     print("正在计算BERTScore...")
@@ -327,15 +259,10 @@ def evaluate_responses_with_batch():
     gc.collect()
 
     print("计算评估指标...")
-    # 分批计算各项指标
-    bleu = evaluate_bleu(predictions, references)
-    rouge = evaluate_rouge(predictions, references)
     bertscore = evaluate_bertscore(predictions, references)
 
     # 结果输出
     return {
-        "BLEU": bleu,
-        "ROUGE": rouge,
         "BERTScore": bertscore,
     }
 
@@ -404,31 +331,11 @@ if __name__ == "__main__":
         print("开始评估测试集...")
         results = evaluate_responses_with_batch()
         print("\n评估结果:")
-        print("BLEU 分数:", results["BLEU"])
-        print("ROUGE 分数:")
-        for metric, scores in results["ROUGE"].items():
-            print(f"  {metric}:")
-            for k, v in scores.items():
-                print(f"    {k}: {v}")
         print("BERTScore:")
         for metric, score in results["BERTScore"].items():
             print(f"  {metric}: {score}")
 
 """
-BLEU 分数: 0.006141322030216605
-ROUGE 分数:
-  rouge-1:
-    f: 0.080093202205372
-    p: 0.0871578195078195
-    r: 0.0815859668109668
-  rouge-2:
-    f: 0.00021052630603878163
-    p: 0.00025
-    r: 0.00018181818181818183
-  rouge-l:
-    f: 0.080093202205372
-    p: 0.0871578195078195
-    r: 0.0815859668109668
 BERTScore:
   Precision: 0.6919788339138031
   Recall: 0.6773922579884529

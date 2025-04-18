@@ -3,11 +3,13 @@ import gc
 import json
 import time
 
-import evaluate
+import faiss
+import numpy as np
 import torch
+from bert_score import score as bert_score
 from py2neo import Graph
-from sentence_transformers import util
-from transformers import AutoTokenizer, AutoModel, AutoModelForCausalLM
+from transformers import AutoTokenizer, AutoModel
+from vllm import LLM, SamplingParams
 
 
 class KnowledgeGraphLoader:
@@ -15,30 +17,73 @@ class KnowledgeGraphLoader:
         self.graph = Graph(uri, auth=(user, password))
 
     def load_knowledge_graph(self):
+        # 修改查询语句，使用type(r)函数获取关系类型
         query = """
         MATCH (h)-[r]->(t)
-        RETURN h.name AS head, t.name AS tail, r.type AS relation
+        RETURN h.name AS head, t.name AS tail, type(r) AS relation
         """
         # 执行Cypher查询并获取结果
         result = self.graph.run(query)
-        triples = [(record["head"], record["tail"], record["relation"]) for record in result]
+        triples = []
+        for record in result:
+            head = record["head"]
+            tail = record["tail"]
+            relation = record["relation"]
+
+            # 确保所有字段都不为None
+            if head is not None and tail is not None and relation is not None:
+                triples.append((head, tail, relation))
+            else:
+                # 如果任何字段为None，打印警告并跳过
+                print(f"警告: 发现不完整的三元组 - 头: {head}, 尾: {tail}, 关系: {relation}")
+
         return triples
 
+    def check_schema(self):
+        """检查Neo4j知识图谱的结构"""
+        # 获取所有的关系类型
+        relation_query = """
+        CALL db.relationshipTypes() YIELD relationshipType
+        RETURN relationshipType
+        """
+        relation_types = [record["relationshipType"] for record in self.graph.run(relation_query)]
 
-# 2. Vectorize the knowledge base
+        # 对于每种关系类型，检查第一个实例的属性
+        relation_props = {}
+        for rel_type in relation_types:
+            prop_query = f"""
+            MATCH ()-[r:{rel_type}]->() 
+            RETURN properties(r) AS props
+            LIMIT 1
+            """
+            result = list(self.graph.run(prop_query))
+            if result:
+                relation_props[rel_type] = result[0]["props"]
+            else:
+                relation_props[rel_type] = {}
+
+        return {
+            "relation_types": relation_types,
+            "relation_properties": relation_props
+        }
+
+
+# 2. Vectorize the knowledge base and store in FAISS index
 def vectorize_knowledge_base(sentences, model, tokenizer):
     formatted_sentences = ["query: " + sentence for sentence in sentences]
 
+    print("正在向量化知识库...")
     # 处理可能的大量三元组，分批次处理
     batch_size = 128
     all_embeddings = []
 
     for i in range(0, len(formatted_sentences), batch_size):
+        print(f"向量化批次 {i // batch_size + 1}/{(len(formatted_sentences) + batch_size - 1) // batch_size}")
         batch = formatted_sentences[i:i + batch_size]
         inputs = tokenizer(batch, padding=True, truncation=True, return_tensors="pt")
         with torch.no_grad():
             embeddings = model(**inputs).last_hidden_state.mean(dim=1)
-        all_embeddings.append(embeddings)
+        all_embeddings.append(embeddings.cpu().numpy())
 
         # 及时清理内存
         del inputs
@@ -46,113 +91,128 @@ def vectorize_knowledge_base(sentences, model, tokenizer):
 
     # 合并所有嵌入
     if len(all_embeddings) == 1:
-        return all_embeddings[0]
+        embeddings_np = all_embeddings[0]
     else:
-        return torch.cat(all_embeddings, dim=0)
+        embeddings_np = np.vstack(all_embeddings)
+
+    # 创建FAISS索引
+    print("创建FAISS索引...")
+    dimension = embeddings_np.shape[1]
+    index = faiss.IndexFlatIP(dimension)  # 使用内积相似度 (等同于余弦相似度，如果向量已归一化)
+
+    # 归一化向量以确保余弦相似度
+    faiss.normalize_L2(embeddings_np)
+
+    # 将向量添加到索引
+    index.add(embeddings_np)
+
+    print(f"FAISS索引创建完成，包含 {index.ntotal} 个向量")
+    return index, embeddings_np
 
 
-# 3. Vectorize the input query
-def vectorize_query(query, model, tokenizer):
+# 3. 向量化查询并从FAISS检索
+def vectorize_query_and_search(query, model, tokenizer, index, k=5):
     formatted_query = "query: " + query
     inputs = tokenizer(formatted_query, truncation=True, return_tensors="pt")
     with torch.no_grad():
-        query_embedding = model(**inputs).last_hidden_state.mean(dim=1)
-    return query_embedding
+        query_embedding = model(**inputs).last_hidden_state.mean(dim=1).cpu().numpy()
+
+    # 归一化查询向量
+    faiss.normalize_L2(query_embedding)
+
+    # 执行近似最近邻搜索
+    D, I = index.search(query_embedding, k)
+
+    # 清理内存
+    del inputs
+    torch.cuda.empty_cache() if torch.cuda.is_available() else None
+
+    return I[0]  # 返回索引
 
 
-# 批量向量化查询
-def batch_vectorize_queries(queries, model, tokenizer, batch_size=16):
-    all_embeddings = []
+# 批量向量化查询并检索
+def batch_query_and_search(queries, model, tokenizer, index, k=5, batch_size=32):
+    all_top_indices = []
+
+    # 分批处理查询
     for i in range(0, len(queries), batch_size):
         batch_queries = queries[i:i + batch_size]
         formatted_queries = ["query: " + query for query in batch_queries]
+
+        # 向量化批次查询
         inputs = tokenizer(formatted_queries, padding=True, truncation=True, return_tensors="pt")
         with torch.no_grad():
-            batch_embeddings = model(**inputs).last_hidden_state.mean(dim=1)
-        all_embeddings.append(batch_embeddings)
+            batch_embeddings = model(**inputs).last_hidden_state.mean(dim=1).cpu().numpy()
 
-        # 及时清理内存
-        del inputs
-        torch.cuda.empty_cache() if torch.cuda.is_available() else None
+        # 归一化向量
+        faiss.normalize_L2(batch_embeddings)
 
-    return torch.cat(all_embeddings, dim=0)
+        # 批量检索
+        D, I = index.search(batch_embeddings, k)
 
-
-# 4. Top-k retrieval
-def retrieve_top_k(query_embedding, knowledge_embeddings, sentences, k=5):
-    scores = util.pytorch_cos_sim(query_embedding, knowledge_embeddings)[0]
-    top_k_indices = torch.topk(scores, k=k).indices
-    return [sentences[i] for i in top_k_indices]
-
-
-# 批量检索
-def batch_retrieve_top_k(query_embeddings, knowledge_embeddings, sentences, k=5):
-    # 分批计算相似度，避免OOM
-    batch_size = 32
-    all_retrieved_knowledge = []
-
-    for i in range(0, len(query_embeddings), batch_size):
-        batch_query_embeddings = query_embeddings[i:i + batch_size]
-
-        # 计算相似度
-        scores = util.pytorch_cos_sim(batch_query_embeddings, knowledge_embeddings)
-        top_k_indices = torch.topk(scores, k=k, dim=1).indices
-
-        # 收集检索到的知识
-        for j in range(len(batch_query_embeddings)):
-            query_knowledge = [sentences[idx] for idx in top_k_indices[j]]
-            all_retrieved_knowledge.append(query_knowledge)
+        # 收集结果
+        for indices in I:
+            all_top_indices.append(indices.tolist())
 
         # 清理内存
-        del scores, top_k_indices
+        del inputs, batch_embeddings
         torch.cuda.empty_cache() if torch.cuda.is_available() else None
 
-    return all_retrieved_knowledge
+    return all_top_indices
 
 
-# 5. Generate answer using retrieved knowledge
-def generate_answer(prompt, knowledge, model, tokenizer):
+# 5. 使用vLLM生成回答
+def generate_answer(prompt, knowledge, llm, tokenizer):
     input_text = prompt + "\n" + "\n".join(knowledge)
-    inputs = tokenizer(input_text, return_tensors="pt", truncation=True, max_length=1024)
-    outputs = model.generate(**inputs, max_length=16384)
-    answer = tokenizer.decode(outputs[0], skip_special_tokens=True)
 
-    # 清理内存
-    del inputs, outputs
-    torch.cuda.empty_cache() if torch.cuda.is_available() else None
+    # 使用vLLM生成回答
+    sampling_params = SamplingParams(temperature=0.7, top_p=0.9, max_tokens=512)
+
+    # 创建聊天消息格式
+    messages = [
+        {"role": "user", "content": input_text}
+    ]
+
+    # 应用聊天模板
+    text = tokenizer.apply_chat_template(
+        messages,
+        tokenize=False,
+        add_generation_prompt=True
+    )
+
+    # 使用vLLM生成
+    outputs = llm.generate([text], sampling_params)
+    answer = outputs[0].outputs[0].text
 
     return answer
 
 
 # 批量生成答案
-def batch_generate_answers(prompt, batch_knowledge, model, tokenizer, batch_size=5):
+def batch_generate_answers(prompt, batch_knowledge, llm, tokenizer, batch_size=5):
     all_answers = []
 
-    for i in range(0, len(batch_knowledge), batch_size):
-        current_batch = batch_knowledge[i:i + batch_size]
-        batch_inputs = []
+    # 准备批量请求
+    batch_texts = []
+    for knowledge in batch_knowledge:
+        input_text = prompt + "\n" + "\n".join(knowledge)
+        messages = [
+            {"role": "user", "content": input_text}
+        ]
+        text = tokenizer.apply_chat_template(
+            messages,
+            tokenize=False,
+            add_generation_prompt=True
+        )
+        batch_texts.append(text)
 
-        for knowledge in current_batch:
-            input_text = prompt + "\n" + "\n".join(knowledge)
-            encoded = tokenizer(input_text, truncation=True, max_length=16384, return_tensors="pt")
-            batch_inputs.append(encoded)
+    # 使用vLLM批量生成
+    sampling_params = SamplingParams(temperature=0.7, top_p=0.9, max_tokens=512)
+    outputs = llm.generate(batch_texts, sampling_params)
 
-        batch_answers = []
-        for inputs in batch_inputs:
-            outputs = model.generate(**inputs, max_length=16384)
-            answer = tokenizer.decode(outputs[0], skip_special_tokens=True)
-            batch_answers.append(answer)
-
-            # 清理内存
-            del outputs
-            torch.cuda.empty_cache() if torch.cuda.is_available() else None
-
-        all_answers.extend(batch_answers)
-
-        # 强制清理内存
-        del batch_inputs
-        gc.collect()
-        torch.cuda.empty_cache() if torch.cuda.is_available() else None
+    # 获取生成的答案
+    for output in outputs:
+        answer = output.outputs[0].text
+        all_answers.append(answer)
 
     return all_answers
 
@@ -164,70 +224,21 @@ def load_json_dataset(file_path):
     return data
 
 
-# 7. Evaluation metrics - 使用 evaluate 库替代 datasets.load_metric
-def compute_metrics_batch(predictions, references):
-    """分批计算评估指标，防止OOM"""
-    print("开始分批计算评估指标...")
+# 7. 改用直接调用bert_score计算评估指标
+def compute_bertscore_batch(predictions, references):
+    """分批计算BERTScore指标，防止OOM"""
+    print("开始计算BERTScore评估指标...")
 
     # 清理内存
     gc.collect()
     torch.cuda.empty_cache() if torch.cuda.is_available() else None
 
-    # 加载评估指标
-    bleu = evaluate.load("bleu")
-    rouge = evaluate.load("rouge")
-    bertscore = evaluate.load("bertscore")
-
-    # 分批计算BLEU
-    print("计算BLEU分数...")
-    batch_size = 200
-    bleu_results = []
-    for i in range(0, len(predictions), batch_size):
-        end_idx = min(i + batch_size, len(predictions))
-        print(f"BLEU: 处理 {i + 1} 到 {end_idx} / {len(predictions)}")
-
-        batch_preds = predictions[i:end_idx]
-        batch_refs = references[i:end_idx]
-
-        # 为每个引用创建一个列表
-        batch_refs_list = [[ref] for ref in batch_refs]
-
-        result = bleu.compute(predictions=batch_preds, references=batch_refs_list)
-        bleu_results.append(result)
-
-        # 清理内存
-        gc.collect()
-
-    # 合并BLEU结果
-    bleu_score = sum(res['bleu'] for res in bleu_results) / len(bleu_results) if bleu_results else 0
-
-    # 分批计算ROUGE
-    print("计算ROUGE分数...")
-    rouge_results = []
-    for i in range(0, len(predictions), batch_size):
-        end_idx = min(i + batch_size, len(predictions))
-        print(f"ROUGE: 处理 {i + 1} 到 {end_idx} / {len(predictions)}")
-
-        batch_preds = predictions[i:end_idx]
-        batch_refs = references[i:end_idx]
-
-        result = rouge.compute(predictions=batch_preds, references=batch_refs)
-        rouge_results.append(result)
-
-        # 清理内存
-        gc.collect()
-
-    # 合并ROUGE结果
-    rouge_score = {}
-    if rouge_results:
-        # 初始化合并结果字典
-        for key in rouge_results[0].keys():
-            rouge_score[key] = sum(res[key] for res in rouge_results) / len(rouge_results)
-
     # 分批计算BERTScore
     print("计算BERTScore分数...")
     batch_size = 32  # BERTScore需要更小的批次
-    all_P, all_R, all_F1 = [], [], []
+    all_P = []
+    all_R = []
+    all_F1 = []
 
     for i in range(0, len(predictions), batch_size):
         end_idx = min(i + batch_size, len(predictions))
@@ -237,17 +248,14 @@ def compute_metrics_batch(predictions, references):
         batch_refs = references[i:end_idx]
 
         try:
-            result = bertscore.compute(
-                predictions=batch_preds,
-                references=batch_refs,
-                lang="zh"
-            )
-            all_P.extend(result["precision"])
-            all_R.extend(result["recall"])
-            all_F1.extend(result["f1"])
+            # 直接使用bert_score库计算分数
+            P, R, F1 = bert_score(batch_preds, batch_refs, lang="zh", verbose=False)
+            all_P.extend(P.tolist())
+            all_R.extend(R.tolist())
+            all_F1.extend(F1.tolist())
         except Exception as e:
             print(f"BERTScore计算异常: {e}")
-            # 如果出现异常，填充零值
+            # 如果出错，添加0分
             all_P.extend([0.0] * len(batch_preds))
             all_R.extend([0.0] * len(batch_preds))
             all_F1.extend([0.0] * len(batch_preds))
@@ -263,31 +271,28 @@ def compute_metrics_batch(predictions, references):
         "f1": sum(all_F1) / len(all_F1) if all_F1 else 0
     }
 
-    return {"bleu": bleu_score}, rouge_score, bertscore_score
+    return bertscore_score
 
 
 # 批量处理问答
-def batch_qa(questions, embedding_model, embedding_tokenizer, gen_model, gen_tokenizer,
-             knowledge_embeddings, sentences, prompt, batch_size=5):
-    """批量处理问题，显示简单进度信息"""
+def batch_qa(questions, embedding_model, embedding_tokenizer, llm, gen_tokenizer,
+             faiss_index, sentences, prompt, batch_size=5):
+    """批量处理问题，使用FAISS加速检索和vLLM加速生成"""
     results = []
     total_batches = (len(questions) + batch_size - 1) // batch_size  # 向上取整计算批次数
 
     print(f"开始处理 {len(questions)} 个问题，共 {total_batches} 个批次")
     start_time = time.time()
 
-    # 批量向量化所有查询
-    print("正在向量化所有查询...")
-    all_query_embeddings = batch_vectorize_queries(questions, embedding_model, embedding_tokenizer, batch_size=32)
+    # 使用FAISS批量检索
+    print("正在执行向量检索...")
+    all_top_indices = batch_query_and_search(questions, embedding_model, embedding_tokenizer, faiss_index, k=5)
 
-    # 批量检索知识
-    print("正在为所有查询检索知识...")
-    all_retrieved_knowledge = batch_retrieve_top_k(all_query_embeddings, knowledge_embeddings, sentences, k=5)
-
-    # 释放不再需要的向量化资源
-    del all_query_embeddings
-    gc.collect()
-    torch.cuda.empty_cache() if torch.cuda.is_available() else None
+    # 转换索引为知识文本
+    all_retrieved_knowledge = []
+    for indices in all_top_indices:
+        knowledge = [sentences[idx] for idx in indices]
+        all_retrieved_knowledge.append(knowledge)
 
     # 批量生成答案
     print("正在生成所有答案...")
@@ -299,7 +304,7 @@ def batch_qa(questions, embedding_model, embedding_tokenizer, gen_model, gen_tok
         batch_knowledge = all_retrieved_knowledge[i:i + batch_size]
 
         # 生成答案
-        batch_answers = batch_generate_answers(prompt, batch_knowledge, gen_model, gen_tokenizer, batch_size=batch_size)
+        batch_answers = batch_generate_answers(prompt, batch_knowledge, llm, gen_tokenizer, batch_size=batch_size)
 
         # 保存结果
         for j, (question, answer, knowledge) in enumerate(zip(batch_questions, batch_answers, batch_knowledge)):
@@ -337,10 +342,8 @@ def batch_qa(questions, embedding_model, embedding_tokenizer, gen_model, gen_tok
 # 从批处理结果中评估性能
 def evaluate_from_batch_results(batch_results, references):
     predictions = [result["answer"] for result in batch_results]
-    bleu, rouge, bertscore = compute_metrics_batch(predictions, references)
+    bertscore = compute_bertscore_batch(predictions, references)
     return {
-        "BLEU": bleu,
-        "ROUGE": rouge,
         "BERTScore": bertscore
     }
 
@@ -354,20 +357,19 @@ def save_batch_results(batch_results, output_file="rag_batch_results.json"):
 
 
 # 释放模型资源
-def release_model_resources(embedding_model, embedding_tokenizer, gen_model, gen_tokenizer):
+def release_model_resources(embedding_model, embedding_tokenizer, llm, gen_tokenizer):
     """释放模型资源以释放内存"""
     del embedding_model
     del embedding_tokenizer
-    del gen_model
-    del gen_tokenizer
+    # vLLM不需要显式删除
     # 强制清理内存
     gc.collect()
     torch.cuda.empty_cache() if torch.cuda.is_available() else None
 
 
 # 评估功能
-def evaluate_dataset(dataset_path, embedding_model, embedding_tokenizer, gen_model, gen_tokenizer,
-                     knowledge_embeddings, sentences, prompt, batch_size=5):
+def evaluate_dataset(dataset_path, embedding_model, embedding_tokenizer, llm, gen_tokenizer,
+                     faiss_index, sentences, prompt, batch_size=5):
     # 尝试从文件加载预处理结果
     result_file = "rag_evaluation_results.json"
     try:
@@ -395,15 +397,15 @@ def evaluate_dataset(dataset_path, embedding_model, embedding_tokenizer, gen_mod
 
         # 批量处理问题
         print(f"开始批量处理，批次大小为 {batch_size}")
-        batch_results = batch_qa(questions, embedding_model, embedding_tokenizer, gen_model, gen_tokenizer,
-                                 knowledge_embeddings, sentences, prompt, batch_size)
+        batch_results = batch_qa(questions, embedding_model, embedding_tokenizer, llm, gen_tokenizer,
+                                 faiss_index, sentences, prompt, batch_size)
 
         # 保存结果
         save_batch_results(batch_results, result_file)
 
     # 释放模型资源以便评估
     print("释放模型资源以便评估...")
-    release_model_resources(embedding_model, embedding_tokenizer, gen_model, gen_tokenizer)
+    release_model_resources(embedding_model, embedding_tokenizer, llm, gen_tokenizer)
 
     # 计算评估指标
     print("计算评估指标...")
@@ -413,12 +415,30 @@ def evaluate_dataset(dataset_path, embedding_model, embedding_tokenizer, gen_mod
     return metrics, batch_results
 
 
+# 保存和加载FAISS索引
+def save_faiss_index(index, filename="knowledge_index.faiss"):
+    """保存FAISS索引到文件"""
+    faiss.write_index(index, filename)
+    print(f"FAISS索引已保存至 {filename}")
+
+
+def load_faiss_index(filename="knowledge_index.faiss"):
+    """从文件加载FAISS索引"""
+    try:
+        index = faiss.read_index(filename)
+        print(f"成功从 {filename} 加载FAISS索引，包含 {index.ntotal} 个向量")
+        return index
+    except Exception as e:
+        print(f"加载FAISS索引失败: {e}")
+        return None
+
+
 # Main function
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="RAG (Retrieval-Augmented Generation) 系统")
     parser.add_argument("--mode", type=str, default="single",
-                        choices=["single", "batch", "evaluate"],
-                        help="运行模式: single(单个问题), batch(批量问答), evaluate(评估)")
+                        choices=["single", "batch", "evaluate", "check_kg"],
+                        help="运行模式: single(单个问题), batch(批量问答), evaluate(评估), check_kg(检查知识图谱)")
     parser.add_argument("--questions", type=str, default="",
                         help="批量问答的问题列表，用分号分隔")
     parser.add_argument("--question", type=str, default="胃痛怎么办？",
@@ -429,31 +449,88 @@ if __name__ == "__main__":
                         help="批量问答结果输出文件")
     parser.add_argument("--dataset", type=str, default="llm/data/MedChatZH_valid.json",
                         help="评估模式使用的数据集路径")
+    parser.add_argument("--use_saved_index", action="store_true",
+                        help="使用保存的FAISS索引文件")
+    parser.add_argument("--model_path", type=str, default="/root/autodl-tmp/models/Qwen2.5-7B-MedChatZH-LoRA-SFT",
+                        help="LLM模型路径")
 
     args = parser.parse_args()
 
+    # 初始化Neo4j连接
+    loader = KnowledgeGraphLoader(uri="bolt://localhost:7687", user="neo4j", password="sukun031015")
+
+    # 添加新的模式：检查知识图谱结构
+    if args.mode == "check_kg":
+        print("正在检查知识图谱结构...")
+        schema_info = loader.check_schema()
+        print("\n关系类型:")
+        for rel_type in schema_info["relation_types"]:
+            print(f"- {rel_type}")
+
+        print("\n关系属性示例:")
+        for rel_type, props in schema_info["relation_properties"].items():
+            print(f"- {rel_type}: {props}")
+
+        # 尝试获取前10个三元组进行检查
+        query = """
+        MATCH (h)-[r]->(t)
+        RETURN h.name AS head, t.name AS tail, type(r) AS rel_type, properties(r) AS rel_props
+        LIMIT 10
+        """
+        print("\n前10个三元组示例:")
+        for i, record in enumerate(loader.graph.run(query)):
+            print(
+                f"{i + 1}. 头: {record['head']}, 尾: {record['tail']}, 关系类型: {record['rel_type']}, 关系属性: {record['rel_props']}")
+
+        exit(0)
+
     # 加载知识图谱
     print("正在从Neo4j加载知识图谱...")
-    # 使用py2neo连接数据库
-    loader = KnowledgeGraphLoader(uri="bolt://localhost:7687", user="neo4j", password="sukun031015")
     triples = loader.load_knowledge_graph()
-    sentences = ["头实体{}和尾实体{}的关系是{}".format(h, t, r) for h, t, r in triples]
+
+    # 检查是否获取到了三元组
+    if not triples:
+        print("错误: 没有从Neo4j中检索到任何三元组。请检查数据库连接和查询。")
+        print("您可以使用 --mode check_kg 模式来检查知识图谱的结构。")
+        exit(1)
+
     print(f"成功加载 {len(triples)} 条三元组")
+
+    # 打印几个三元组示例以便检查
+    print("三元组示例:")
+    for i, (h, t, r) in enumerate(triples[:5]):
+        print(f"{i + 1}. 头实体: {h}, 尾实体: {t}, 关系: {r}")
+
+    sentences = ["头实体《{}》和尾实体《{}》的关系是《{}》".format(h, t, r) for h, t, r in triples]
 
     # 加载嵌入模型
     print("正在加载嵌入模型...")
     embedding_tokenizer = AutoTokenizer.from_pretrained("intfloat/multilingual-e5-small")
     embedding_model = AutoModel.from_pretrained("intfloat/multilingual-e5-small")
 
-    # 加载生成模型
-    print("正在加载生成模型...")
-    gen_tokenizer = AutoTokenizer.from_pretrained("/root/autodl-tmp/models/Qwen2.5-7B-MedChatZH-LoRA-SFT")
-    gen_model = AutoModelForCausalLM.from_pretrained("/root/autodl-tmp/models/Qwen2.5-7B-MedChatZH-LoRA-SFT")
+    # 加载FAISS索引或创建新索引
+    faiss_index = None
+    if args.use_saved_index:
+        faiss_index = load_faiss_index()
 
-    # 向量化知识库
-    print("正在向量化知识库...")
-    knowledge_embeddings = vectorize_knowledge_base(sentences, embedding_model, embedding_tokenizer)
-    print("知识库向量化完成")
+    if faiss_index is None:
+        # 创建新的FAISS索引
+        faiss_index, _ = vectorize_knowledge_base(sentences, embedding_model, embedding_tokenizer)
+        # 保存索引以便后续使用
+        save_faiss_index(faiss_index)
+
+    # 使用vLLM加载生成模型
+    print("正在加载生成模型 (使用vLLM)...")
+    gen_tokenizer = AutoTokenizer.from_pretrained(args.model_path)
+
+    # 使用vLLM初始化大语言模型，设置正确的上下文长度
+    print("初始化vLLM引擎...")
+    llm = LLM(
+        model=args.model_path,
+        max_model_len=16384,
+        gpu_memory_utilization=0.9
+    )
+    print("vLLM引擎初始化完成")
 
     # 提示词
     prompt = "你作为中医诊疗专家，请基于下列检索获得的中医知识进行回答，确保专业性与可读性的平衡，最终形成逻辑缜密、重点突出的中医知识回答："
@@ -463,17 +540,16 @@ if __name__ == "__main__":
         question = args.question
         print(f"问题: {question}")
 
-        # 向量化查询
-        query_embedding = vectorize_query(question, embedding_model, embedding_tokenizer)
+        # 向量化查询并检索
+        top_indices = vectorize_query_and_search(question, embedding_model, embedding_tokenizer, faiss_index)
+        top_k_knowledge = [sentences[i] for i in top_indices]
 
-        # 检索知识
-        top_k_knowledge = retrieve_top_k(query_embedding, knowledge_embeddings, sentences)
         print("检索到的知识:")
         for i, k in enumerate(top_k_knowledge):
             print(f"{i + 1}. {k}")
 
         # 生成答案
-        answer = generate_answer(prompt, top_k_knowledge, gen_model, gen_tokenizer)
+        answer = generate_answer(prompt, top_k_knowledge, llm, gen_tokenizer)
         print(f"回答: {answer}")
 
     elif args.mode == "batch":
@@ -485,8 +561,8 @@ if __name__ == "__main__":
             print("未提供问题列表，使用默认问题进行测试...")
             questions = ["生姜有什么功能？", "胃痛怎么办？", "中暑有什么症状？", "附子的功效是什么？", "如何治疗感冒？"]
 
-        batch_results = batch_qa(questions, embedding_model, embedding_tokenizer, gen_model, gen_tokenizer,
-                                 knowledge_embeddings, sentences, prompt, args.batch_size)
+        batch_results = batch_qa(questions, embedding_model, embedding_tokenizer, llm, gen_tokenizer,
+                                 faiss_index, sentences, prompt, args.batch_size)
         save_batch_results(batch_results, args.output)
 
         # 打印结果摘要
@@ -499,12 +575,10 @@ if __name__ == "__main__":
         # 评估测试集
         print(f"开始评估测试集: {args.dataset}")
 
-        metrics, _ = evaluate_dataset(args.dataset, embedding_model, embedding_tokenizer, gen_model, gen_tokenizer,
-                                      knowledge_embeddings, sentences, prompt, args.batch_size)
+        metrics, _ = evaluate_dataset(args.dataset, embedding_model, embedding_tokenizer, llm, gen_tokenizer,
+                                      faiss_index, sentences, prompt, args.batch_size)
 
         print("\n评估结果:")
-        print("BLEU:", metrics["BLEU"])
-        print("ROUGE:", metrics["ROUGE"])
         print("BERTScore:")
         for metric, score in metrics["BERTScore"].items():
             print(f"  {metric}: {score}")
