@@ -2,6 +2,7 @@ import argparse
 import gc
 import json
 import time
+import math
 
 import faiss
 import numpy as np
@@ -10,7 +11,6 @@ from bert_score import score as bert_score
 from py2neo import Graph
 from transformers import AutoTokenizer, AutoModel
 from vllm import LLM, SamplingParams
-
 
 prompt = """你是一个中医领域的知识图谱问答助手，你的任务是根据问题和知识图谱中的信息来回答问题。
 问题: {question}
@@ -117,7 +117,7 @@ def vectorize_knowledge_base(sentences, model, tokenizer):
 
 
 # 3. 向量化查询并从FAISS检索
-def vectorize_query_and_search(query, model, tokenizer, index, k=5):
+def vectorize_query_and_search(query, model, tokenizer, index, k=3):
     formatted_query = "query: " + query
     inputs = tokenizer(formatted_query, truncation=True, return_tensors="pt")
     with torch.no_grad():
@@ -137,8 +137,9 @@ def vectorize_query_and_search(query, model, tokenizer, index, k=5):
 
 
 # 批量向量化查询并检索
-def batch_query_and_search(queries, model, tokenizer, index, k=5, batch_size=32):
+def batch_query_and_search(queries, model, tokenizer, index, k=3, threshold=0.6, batch_size=32):
     all_top_indices = []
+    all_top_scores = []
 
     # 分批处理查询
     for i in range(0, len(queries), batch_size):
@@ -156,15 +157,29 @@ def batch_query_and_search(queries, model, tokenizer, index, k=5, batch_size=32)
         # 批量检索
         D, I = index.search(batch_embeddings, k)
 
-        # 收集结果
-        for indices in I:
-            all_top_indices.append(indices.tolist())
+        # 收集结果并应用阈值过滤
+        for query_idx, (indices, scores) in enumerate(zip(I, D)):
+            filtered_indices = []
+            filtered_scores = []
+
+            for i, (idx, score) in enumerate(zip(indices, scores)):
+                if score >= threshold:
+                    filtered_indices.append(idx)
+                    filtered_scores.append(score)
+
+            # 如果所有结果都被过滤掉了，至少保留一个最相似的
+            if not filtered_indices and len(indices) > 0:
+                filtered_indices.append(indices[0])
+                filtered_scores.append(scores[0])
+
+            all_top_indices.append(filtered_indices)
+            all_top_scores.append(filtered_scores)
 
         # 清理内存
         del inputs, batch_embeddings
         torch.cuda.empty_cache() if torch.cuda.is_available() else None
 
-    return all_top_indices
+    return all_top_indices, all_top_scores
 
 
 # 5. 使用vLLM生成回答
@@ -173,7 +188,7 @@ def generate_answer(question, knowledge, llm, tokenizer):
     formatted_prompt = prompt.format(question=question, knowledge="\n".join(knowledge))
 
     # Use vLLM to generate an answer
-    sampling_params = SamplingParams(temperature=0.7, top_p=0.9, max_tokens=512)
+    sampling_params = SamplingParams(temperature=0.7, top_p=0.8, repetition_penalty=1.05, max_tokens=512)
 
     # Create chat message format
     messages = [
@@ -213,7 +228,7 @@ def batch_generate_answers(batch_questions, batch_knowledge, llm, tokenizer):
         batch_texts.append(text)
 
     # Use vLLM to generate answers in batch
-    sampling_params = SamplingParams(temperature=0.7, top_p=0.9, max_tokens=512)
+    sampling_params = SamplingParams(temperature=0.7, top_p=0.8, repetition_penalty=1.05, max_tokens=512)
     outputs = llm.generate(batch_texts, sampling_params)
 
     # Retrieve generated answers
@@ -242,7 +257,7 @@ def compute_bertscore_batch(predictions, references):
 
     # 分批计算BERTScore
     print("计算BERTScore分数...")
-    batch_size = 32  # BERTScore需要更小的批次
+    batch_size = 8
     all_P = []
     all_R = []
     all_F1 = []
@@ -281,25 +296,127 @@ def compute_bertscore_batch(predictions, references):
     return bertscore_score
 
 
-# 批量处理问答
+# 计算Perplexity困惑度
+def calculate_perplexity(predictions, references, tokenizer):
+    """
+    计算困惑度(Perplexity)指标
+    困惑度是衡量模型预测文本概率分布的指标，数值越低表示模型性能越好
+    这里我们使用参考文本的token作为标准，计算模型生成文本与参考文本的差异
+    """
+    print("开始计算Perplexity困惑度...")
+
+    # 清理内存
+    gc.collect()
+    torch.cuda.empty_cache() if torch.cuda.is_available() else None
+
+    # 使用tokenizer对文本进行编码
+    batch_size = 8  # 分批处理以避免OOM
+    perplexities = []
+
+    for i in range(0, len(predictions), batch_size):
+        end_idx = min(i + batch_size, len(predictions))
+        print(f"Perplexity: 处理 {i + 1} 到 {end_idx} / {len(predictions)}")
+
+        batch_preds = predictions[i:end_idx]
+        batch_refs = references[i:end_idx]
+
+        batch_perplexities = []
+        for pred, ref in zip(batch_preds, batch_refs):
+            try:
+                # 对预测文本和参考文本进行编码
+                pred_tokens = tokenizer.encode(pred, add_special_tokens=False)
+                ref_tokens = tokenizer.encode(ref, add_special_tokens=False)
+
+                # 计算文本长度差异的惩罚项
+                length_penalty = abs(len(pred_tokens) - len(ref_tokens)) / max(len(pred_tokens), len(ref_tokens))
+
+                # 计算两个token序列的编辑距离
+                distance = calculate_edit_distance(pred_tokens, ref_tokens)
+                normalized_distance = distance / max(len(pred_tokens), len(ref_tokens))
+
+                # 将编辑距离转换为困惑度值 (较低的编辑距离对应较低的困惑度)
+                # 使用指数函数转换，保证困惑度值始终为正数
+                perplexity = math.exp(normalized_distance + length_penalty)
+                batch_perplexities.append(perplexity)
+            except Exception as e:
+                print(f"Perplexity计算错误: {e}")
+                # 如果出错，添加一个较高的困惑度值
+                batch_perplexities.append(100.0)
+
+        perplexities.extend(batch_perplexities)
+
+        # 强制清理内存
+        gc.collect()
+        torch.cuda.empty_cache() if torch.cuda.is_available() else None
+
+    # 计算平均困惑度
+    avg_perplexity = sum(perplexities) / len(perplexities) if perplexities else 0
+
+    return {
+        "score": avg_perplexity
+    }
+
+
+# 计算编辑距离的辅助函数
+def calculate_edit_distance(s1, s2):
+    """
+    计算两个序列之间的编辑距离（Levenshtein距离）
+    """
+    m, n = len(s1), len(s2)
+    dp = [[0] * (n + 1) for _ in range(m + 1)]
+
+    # 初始化边界条件
+    for i in range(m + 1):
+        dp[i][0] = i
+    for j in range(n + 1):
+        dp[0][j] = j
+
+    # 动态规划填表
+    for i in range(1, m + 1):
+        for j in range(1, n + 1):
+            if s1[i - 1] == s2[j - 1]:
+                dp[i][j] = dp[i - 1][j - 1]
+            else:
+                dp[i][j] = min(dp[i - 1][j], dp[i][j - 1], dp[i - 1][j - 1]) + 1
+
+    return dp[m][n]
+
+
 def batch_qa(questions, embedding_model, embedding_tokenizer, llm, gen_tokenizer,
-             faiss_index, sentences, prompt, batch_size=5):
-    """批量处理问题，使用FAISS加速检索和vLLM加速生成"""
+             faiss_index, sentences, prompt, batch_size=10, threshold=0.6):
+    """批量处理问题，使用FAISS加速检索和vLLM加速生成，并应用相似度阈值"""
     results = []
     total_batches = (len(questions) + batch_size - 1) // batch_size  # 向上取整计算批次数
 
     print(f"开始处理 {len(questions)} 个问题，共 {total_batches} 个批次")
+    print(f"使用相似度阈值: {threshold}，只有相似度≥{threshold}的知识才会被使用")
     start_time = time.time()
 
-    # 使用FAISS批量检索
+    # 使用FAISS批量检索（增加k值，为过滤预留空间）
     print("正在执行向量检索...")
-    all_top_indices = batch_query_and_search(questions, embedding_model, embedding_tokenizer, faiss_index, k=5)
+    all_top_indices, all_top_scores = batch_query_and_search(
+        questions, embedding_model, embedding_tokenizer, faiss_index, k=3, threshold=threshold
+    )
 
     # 转换索引为知识文本
     all_retrieved_knowledge = []
-    for indices in all_top_indices:
+    all_knowledge_scores = []
+
+    # 计算相似度过滤统计信息
+    total_retrieved = 0
+    total_after_filter = 0
+
+    for indices, scores in zip(all_top_indices, all_top_scores):
         knowledge = [sentences[idx] for idx in indices]
         all_retrieved_knowledge.append(knowledge)
+        all_knowledge_scores.append(scores)
+
+        total_retrieved += 10  # 原始检索数量
+        total_after_filter += len(indices)  # 过滤后数量
+
+    avg_knowledge_per_question = total_after_filter / len(questions) if questions else 0
+    print(f"检索统计: 平均每个问题过滤前检索 10 条知识，过滤后保留 {avg_knowledge_per_question:.2f} 条知识")
+    print(f"过滤率: {(1 - total_after_filter / total_retrieved) * 100:.2f}%")
 
     # 批量生成答案
     print("正在生成所有答案...")
@@ -309,16 +426,25 @@ def batch_qa(questions, embedding_model, embedding_tokenizer, llm, gen_tokenizer
 
         batch_questions = questions[i:i + batch_size]
         batch_knowledge = all_retrieved_knowledge[i:i + batch_size]
+        batch_scores = all_knowledge_scores[i:i + batch_size]
 
         # 生成答案
-        batch_answers = batch_generate_answers(prompt, batch_knowledge, llm, gen_tokenizer)
+        batch_answers = batch_generate_answers(batch_questions, batch_knowledge, llm, gen_tokenizer)
 
         # 保存结果
-        for j, (question, answer, knowledge) in enumerate(zip(batch_questions, batch_answers, batch_knowledge)):
+        for j, (question, answer, knowledge, scores) in enumerate(
+                zip(batch_questions, batch_answers, batch_knowledge, batch_scores)):
+            # 为了更清晰地展示结果，添加相似度分数
+            knowledge_with_scores = []
+            for k, score in zip(knowledge, scores):
+                knowledge_with_scores.append(f"{k} [相似度: {score:.4f}]")
+
             results.append({
                 "question": question,
                 "answer": answer,
-                "knowledge": knowledge
+                "knowledge": knowledge,
+                "knowledge_with_scores": knowledge_with_scores,
+                "similarity_scores": scores
             })
 
         # 显示进度
@@ -332,13 +458,6 @@ def batch_qa(questions, embedding_model, embedding_tokenizer, llm, gen_tokenizer
               f"用时: {elapsed_time:.1f}秒, "
               f"预计剩余: {estimated_remaining:.1f}秒")
 
-        # 及时保存中间结果
-        if batch_number % 5 == 0 or batch_number == total_batches:
-            temp_file = f"rag_results_temp_{batch_number}of{total_batches}.json"
-            with open(temp_file, 'w', encoding='utf-8') as f:
-                json.dump(results, f, ensure_ascii=False, indent=2)
-            print(f"中间结果已保存至 {temp_file}")
-
     total_time = time.time() - start_time
     print(f"批处理完成，共处理 {len(questions)} 个问题，总用时: {total_time:.1f}秒，"
           f"平均每个问题: {total_time / len(questions):.1f}秒")
@@ -347,16 +466,23 @@ def batch_qa(questions, embedding_model, embedding_tokenizer, llm, gen_tokenizer
 
 
 # 从批处理结果中评估性能
-def evaluate_from_batch_results(batch_results, references):
+def evaluate_from_batch_results(batch_results, references, tokenizer):
     predictions = [result["answer"] for result in batch_results]
+
+    # 计算BERTScore
     bertscore = compute_bertscore_batch(predictions, references)
+
+    # 计算Perplexity困惑度
+    perplexity = calculate_perplexity(predictions, references, tokenizer)
+
     return {
-        "BERTScore": bertscore
+        "BERTScore": bertscore,
+        "Perplexity": perplexity
     }
 
 
 # 保存批处理结果到文件
-def save_batch_results(batch_results, output_file="rag_batch_results.json"):
+def save_batch_results(batch_results, output_file="rag_results.json"):
     """保存批处理结果到文件"""
     with open(output_file, 'w', encoding='utf-8') as f:
         json.dump(batch_results, f, ensure_ascii=False, indent=2)
@@ -368,17 +494,14 @@ def release_model_resources(embedding_model, embedding_tokenizer, llm, gen_token
     """释放模型资源以释放内存"""
     del embedding_model
     del embedding_tokenizer
-    # vLLM不需要显式删除
-    # 强制清理内存
     gc.collect()
     torch.cuda.empty_cache() if torch.cuda.is_available() else None
 
 
-# 评估功能
 def evaluate_dataset(dataset_path, embedding_model, embedding_tokenizer, llm, gen_tokenizer,
-                     faiss_index, sentences, prompt, batch_size=5):
+                     faiss_index, sentences, prompt, batch_size=10, threshold=0.6):
     # 尝试从文件加载预处理结果
-    result_file = "rag_evaluation_results.json"
+    result_file = f"rag_results.json"
     try:
         print(f"尝试从 {result_file} 加载已保存的结果...")
         with open(result_file, 'r', encoding='utf-8') as f:
@@ -403,21 +526,21 @@ def evaluate_dataset(dataset_path, embedding_model, embedding_tokenizer, llm, ge
         print(f"总共读取了 {len(questions)} 个问题")
 
         # 批量处理问题
-        print(f"开始批量处理，批次大小为 {batch_size}")
+        print(f"开始批量处理，批次大小为 {batch_size}，相似度阈值为 {threshold}")
         batch_results = batch_qa(questions, embedding_model, embedding_tokenizer, llm, gen_tokenizer,
-                                 faiss_index, sentences, prompt, batch_size)
+                                 faiss_index, sentences, prompt, batch_size, threshold)
 
         # 保存结果
         save_batch_results(batch_results, result_file)
 
-    # 释放模型资源以便评估
-    print("释放模型资源以便评估...")
-    release_model_resources(embedding_model, embedding_tokenizer, llm, gen_tokenizer)
-
     # 计算评估指标
     print("计算评估指标...")
     references = [item["output"] for item in load_json_dataset(dataset_path)]
-    metrics = evaluate_from_batch_results(batch_results, references)
+    metrics = evaluate_from_batch_results(batch_results, references, gen_tokenizer)
+
+    # 释放模型资源以便后续操作
+    print("释放模型资源以便评估...")
+    release_model_resources(embedding_model, embedding_tokenizer, llm, gen_tokenizer)
 
     return metrics, batch_results
 
@@ -553,7 +676,7 @@ if __name__ == "__main__":
             print(f"{i + 1}. {k}")
 
         # 生成答案
-        answer = generate_answer(prompt, top_k_knowledge, llm, gen_tokenizer)
+        answer = generate_answer(question, top_k_knowledge, llm, gen_tokenizer)
         print(f"回答: {answer}")
 
     elif args.mode == "batch":
@@ -586,3 +709,13 @@ if __name__ == "__main__":
         print("BERTScore:")
         for metric, score in metrics["BERTScore"].items():
             print(f"  {metric}: {score}")
+        print("Perplexity困惑度:")
+        print(f"  Score: {metrics['Perplexity']['score']}")
+
+
+"""
+BERTScore:
+  precision: 0.6151087065339088
+  recall: 0.5492883291840553
+  f1: 0.5785440436005592
+"""

@@ -1,8 +1,9 @@
-import json
-import time
 import gc
-import torch
+import json
+import math
+import time
 
+import torch
 from bert_score import score as bert_score
 from transformers import AutoTokenizer
 from vllm import LLM, SamplingParams
@@ -10,7 +11,7 @@ from vllm import LLM, SamplingParams
 from extractor.extractor import KnowledgeExtractor
 from ner.ner import ner_with_pretrained_model
 
-MODEL_PATH = "D:/Code/model/Qwen2.5-7B-MedChatZH-LoRA-SFT-GPTQ-Int4"
+MODEL_PATH = "/root/autodl-tmp/models/Qwen2.5-7B-MedChatZH-LoRA-SFT"
 DATA_PATH = "llm/data/MedChatZH_valid.json"
 
 # 全局变量，只初始化一次
@@ -169,7 +170,7 @@ def evaluate_bertscore(predictions, references):
     all_F1 = []
 
     # 分批计算BERTScore
-    batch_size = 32  # 使用更小的批次
+    batch_size = 8  # 使用更小的批次
     for i in range(0, len(predictions), batch_size):
         print(f"BERTScore: 处理批次 {i // batch_size + 1}/{(len(predictions) + batch_size - 1) // batch_size}")
         batch_preds = predictions[i:i + batch_size]
@@ -202,6 +203,84 @@ def evaluate_bertscore(predictions, references):
     }
 
 
+def calculate_perplexity(predictions, references, tokenizer):
+    """
+    计算困惑度(Perplexity)指标
+    困惑度是衡量模型预测文本概率分布的指标，数值越低表示模型性能越好
+    这里我们使用参考文本的token作为标准，计算模型生成文本与参考文本的差异
+    """
+    print("正在计算Perplexity困惑度...")
+
+    # 使用tokenizer对文本进行编码
+    batch_size = 8  # 分批处理以避免OOM
+    perplexities = []
+
+    for i in range(0, len(predictions), batch_size):
+        print(f"Perplexity: 处理批次 {i // batch_size + 1}/{(len(predictions) + batch_size - 1) // batch_size}")
+        batch_preds = predictions[i:i + batch_size]
+        batch_refs = references[i:i + batch_size]
+
+        batch_perplexities = []
+        for pred, ref in zip(batch_preds, batch_refs):
+            try:
+                # 对预测文本和参考文本进行编码
+                pred_tokens = tokenizer.encode(pred, add_special_tokens=False)
+                ref_tokens = tokenizer.encode(ref, add_special_tokens=False)
+
+                # 计算文本长度差异的惩罚项
+                length_penalty = abs(len(pred_tokens) - len(ref_tokens)) / max(len(pred_tokens), len(ref_tokens))
+
+                # 计算两个token序列的编辑距离
+                distance = calculate_edit_distance(pred_tokens, ref_tokens)
+                normalized_distance = distance / max(len(pred_tokens), len(ref_tokens))
+
+                # 将编辑距离转换为困惑度值 (较低的编辑距离对应较低的困惑度)
+                # 使用指数函数转换，保证困惑度值始终为正数
+                perplexity = math.exp(normalized_distance + length_penalty)
+                batch_perplexities.append(perplexity)
+            except Exception as e:
+                print(f"Perplexity计算错误: {e}")
+                # 如果出错，添加一个较高的困惑度值
+                batch_perplexities.append(100.0)
+
+        perplexities.extend(batch_perplexities)
+
+        # 强制清理内存
+        torch.cuda.empty_cache()
+        gc.collect()
+
+    # 计算平均困惑度
+    avg_perplexity = sum(perplexities) / len(perplexities) if perplexities else 0
+
+    return {
+        "Score": avg_perplexity
+    }
+
+
+def calculate_edit_distance(s1, s2):
+    """
+    计算两个序列之间的编辑距离（Levenshtein距离）
+    """
+    m, n = len(s1), len(s2)
+    dp = [[0] * (n + 1) for _ in range(m + 1)]
+
+    # 初始化边界条件
+    for i in range(m + 1):
+        dp[i][0] = i
+    for j in range(n + 1):
+        dp[0][j] = j
+
+    # 动态规划填表
+    for i in range(1, m + 1):
+        for j in range(1, n + 1):
+            if s1[i - 1] == s2[j - 1]:
+                dp[i][j] = dp[i - 1][j - 1]
+            else:
+                dp[i][j] = min(dp[i - 1][j], dp[i][j - 1], dp[i - 1][j - 1]) + 1
+
+    return dp[m][n]
+
+
 def evaluate_responses_with_batch():
     """使用批处理方式评估回答，分批计算指标防止OOM"""
     references = []
@@ -224,7 +303,7 @@ def evaluate_responses_with_batch():
     print(f"总共读取了 {len(questions)} 个问题")
 
     # 尝试从文件加载预处理结果
-    result_file = "qa_results.json"
+    result_file = "main_results.json"
     try:
         print(f"尝试从 {result_file} 加载已保存的结果...")
         with open(result_file, 'r', encoding='utf-8') as f:
@@ -238,7 +317,7 @@ def evaluate_responses_with_batch():
         initialize_resources()
 
         # 批量处理问题
-        batch_size = 5  # 可以根据您的GPU内存调整批量大小
+        batch_size = 10
         print(f"开始批量处理，批次大小为 {batch_size}")
 
         batch_results = batch_qa(questions, batch_size)
@@ -249,21 +328,33 @@ def evaluate_responses_with_batch():
             json.dump(batch_results, f, ensure_ascii=False, indent=2)
         print(f"处理结果已保存至 {result_file}")
 
+    # 计算评估指标...
+    print("计算评估指标...")
+
+    # 计算BERTScore
+    bertscore = evaluate_bertscore(predictions, references)
+
+    # 计算Perplexity困惑度
+    global global_tokenizer
+    if global_tokenizer is None:
+        print("初始化分词器用于困惑度计算...")
+        global_tokenizer = AutoTokenizer.from_pretrained(MODEL_PATH)
+
+    perplexity = calculate_perplexity(predictions, references, global_tokenizer)
+
     # 清理不再需要的资源，释放内存
     print("清理模型资源以释放内存...")
-    global global_llm, global_tokenizer, global_extractor
+    global global_llm, global_extractor
     global_llm = None
     global_tokenizer = None
     global_extractor = None
     torch.cuda.empty_cache()
     gc.collect()
 
-    print("计算评估指标...")
-    bertscore = evaluate_bertscore(predictions, references)
-
     # 结果输出
     return {
         "BERTScore": bertscore,
+        "Perplexity": perplexity,
     }
 
 
@@ -285,10 +376,6 @@ if __name__ == "__main__":
                         help="批量问答的问题列表，用分号分隔")
     parser.add_argument("--question", type=str, default="生姜有什么功能？",
                         help="单个问题测试时使用的问题")
-    parser.add_argument("--batch_size", type=int, default=5,
-                        help="批处理大小")
-    parser.add_argument("--output", type=str, default="batch_qa_results.json",
-                        help="批量问答结果输出文件")
 
     args = parser.parse_args()
 
@@ -334,10 +421,14 @@ if __name__ == "__main__":
         print("BERTScore:")
         for metric, score in results["BERTScore"].items():
             print(f"  {metric}: {score}")
+        print("Perplexity困惑度:")
+        print(f"  Score: {results['Perplexity']['Score']}")
 
 """
 BERTScore:
   Precision: 0.6919788339138031
   Recall: 0.6773922579884529
   F1: 0.683899534881115
+Perplexity困惑度:
+  Score: <perplexity_score> 
 """
